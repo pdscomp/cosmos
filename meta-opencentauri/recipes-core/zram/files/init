@@ -10,61 +10,141 @@
 ### END INIT INFO
 set -e
 
+# Defaults; override any of them in /etc/default/zram.
+[ -f /etc/default/zram ] && . /etc/default/zram || true
+FACTOR=${FACTOR:-200} # percentage of RAM
+COMPRESSOR=${COMPRESSOR:-lz4}
+PRIORITY=${PRIORITY:-100}
+SWAPPINESS=${SWAPPINESS:-150}
+WATERMARK_BOOST_FACTOR=${WATERMARK_BOOST_FACTOR:-0}
+WATERMARK_SCALE_FACTOR=${WATERMARK_SCALE_FACTOR:-125}
+PAGE_CLUSTER=${PAGE_CLUSTER:-0}
+VFS_CACHE_PRESSURE=${VFS_CACHE_PRESSURE:-500}
+RESET_RETRIES=${RESET_RETRIES:-20}
+RESET_SLEEP=${RESET_SLEEP:-0.25}
+
+# Best-effort only: syslog is not up yet.
+log() {
+    { printf 'zram: %s\n' "$*" > /dev/kmsg; } 2>/dev/null ||
+        printf 'zram: %s\n' "$*" >&2 || :
+}
+
 start() {
-    #default Factor % = 200 change this value here or create /etc/default/zram
-    FACTOR=200
-    #& put the above single line in /etc/default/zram with the value you want
-    [ -f /etc/default/zram ] && . /etc/default/zram || true
-    factor=$FACTOR # percentage
+    if active=$(grep '^/dev/zram0[[:space:]]' /proc/swaps 2>&1); then
+        log "already active: $active"
+        return 0
+    else
+        rc=$?
+        [ "$rc" -eq 1 ] || { log "swap status FAILED: $active"; return 1; }
+    fi
+
+    case "$FACTOR" in
+        ''|*[!0-9]*) log "invalid FACTOR: $FACTOR"; return 1 ;;
+    esac
+    if ! [ "$FACTOR" -gt 0 ] 2>/dev/null; then
+        log "invalid FACTOR: $FACTOR"
+        return 1
+    fi
+    case "$RESET_RETRIES" in
+        ''|*[!0-9]*) log "invalid RESET_RETRIES: $RESET_RETRIES"; return 1 ;;
+    esac
+    if ! [ "$RESET_RETRIES" -gt 0 ] 2>/dev/null; then
+        log "invalid RESET_RETRIES: $RESET_RETRIES"
+        return 1
+    fi
 
     # get the amount of memory in the machine
     memtotal=$(grep MemTotal /proc/meminfo | awk ' { print $2 } ')
-    disksize=$(($memtotal*$factor/100*1024))
+    disksize=$(($memtotal*$FACTOR/100*1024))
+    log "memtotal=${memtotal}kB disksize=${disksize}B factor=${FACTOR}% compressor=${COMPRESSOR} priority=${PRIORITY}"
 
     # load dependency modules
-    modprobe zram num_devices=1
-    echo "zram devices probed successfully"
+    err=$(modprobe zram num_devices=1 2>&1) ||
+        { log "modprobe FAILED: $err"; return 1; }
+    log "modprobe ok"
 
-    # udev opens the new block device to probe it, and a reset while it is
-    # open fails with EBUSY. With "set -e" that used to end this script
-    # silently, before swap was ever enabled. Retry until udev lets go
-    # (a few milliseconds normally, bounded at 5 s).
+    if err=$(udevadm settle --timeout=3 2>&1); then
+        log "udev settle ok"
+    else
+        log "udev settle FAILED (continuing, reset retry guards): $err"
+    fi
+
+    # udev may still hold the new device open; retry reset until it lets go.
     tries=0
-    while ! echo 1 > /sys/block/zram0/reset 2>/dev/null; do
+    while ! err=$( { echo 1 > /sys/block/zram0/reset; } 2>&1 ); do
         tries=$((tries + 1))
-        if [ "$tries" -ge 20 ]; then
-            echo "zram: /sys/block/zram0/reset still busy after $tries tries, giving up"
+        log "reset FAILED (attempt $tries/$RESET_RETRIES): $err"
+        if [ "$tries" -ge "$RESET_RETRIES" ]; then
+            log "/sys/block/zram0/reset failed after $tries tries, giving up"
             return 1
         fi
-        sleep 0.25
+        sleep "$RESET_SLEEP"
     done
-    [ "$tries" -gt 0 ] && echo "zram: reset succeeded after $tries retries"
+    log "reset ok after $tries retries"
 
-    echo lz4 > /sys/block/zram0/comp_algorithm
-    echo $disksize > /sys/block/zram0/disksize
+    err=$( { echo "$COMPRESSOR" > /sys/block/zram0/comp_algorithm; } 2>&1 ) ||
+        { log "comp_algorithm $COMPRESSOR FAILED: $err"; return 1; }
+    log "comp_algorithm $COMPRESSOR ok"
+    err=$( { echo "$disksize" > /sys/block/zram0/disksize; } 2>&1 ) ||
+        { log "disksize FAILED: $err"; return 1; }
+    log "disksize ok"
 
     # Creating swap filesystems
-    mkswap /dev/zram0
+    err=$(mkswap /dev/zram0 2>&1) ||
+        { log "mkswap FAILED: $err"; return 1; }
+    log "mkswap ok"
 
     # zram tuning
-    echo 150 > /proc/sys/vm/swappiness
-    echo 0   > /proc/sys/vm/watermark_boost_factor
-    echo 125 > /proc/sys/vm/watermark_scale_factor
-    echo 0   > /proc/sys/vm/page-cluster
-    echo 500 > /proc/sys/vm/vfs_cache_pressure
+    err=$( { echo "$SWAPPINESS" > /proc/sys/vm/swappiness; } 2>&1 ) ||
+        { log "swappiness $SWAPPINESS FAILED: $err"; return 1; }
+    log "swappiness $SWAPPINESS ok"
+    err=$( { echo "$WATERMARK_BOOST_FACTOR" > /proc/sys/vm/watermark_boost_factor; } 2>&1 ) ||
+        { log "watermark_boost_factor $WATERMARK_BOOST_FACTOR FAILED: $err"; return 1; }
+    log "watermark_boost_factor $WATERMARK_BOOST_FACTOR ok"
+    err=$( { echo "$WATERMARK_SCALE_FACTOR" > /proc/sys/vm/watermark_scale_factor; } 2>&1 ) ||
+        { log "watermark_scale_factor $WATERMARK_SCALE_FACTOR FAILED: $err"; return 1; }
+    log "watermark_scale_factor $WATERMARK_SCALE_FACTOR ok"
+    err=$( { echo "$PAGE_CLUSTER" > /proc/sys/vm/page-cluster; } 2>&1 ) ||
+        { log "page-cluster $PAGE_CLUSTER FAILED: $err"; return 1; }
+    log "page-cluster $PAGE_CLUSTER ok"
+    err=$( { echo "$VFS_CACHE_PRESSURE" > /proc/sys/vm/vfs_cache_pressure; } 2>&1 ) ||
+        { log "vfs_cache_pressure $VFS_CACHE_PRESSURE FAILED: $err"; return 1; }
+    log "vfs_cache_pressure $VFS_CACHE_PRESSURE ok"
 
     # Switch the swaps on
-    swapon -p 100 /dev/zram0
+    err=$(swapon -p "$PRIORITY" /dev/zram0 2>&1) ||
+        { log "swapon FAILED (priority $PRIORITY): $err"; return 1; }
+    log "swapon ok (priority $PRIORITY)"
+    if active=$(grep '^/dev/zram0[[:space:]]' /proc/swaps 2>&1); then
+        log "active: $active"
+    else
+        log "verify FAILED: /dev/zram0 not confirmed in /proc/swaps${active:+: $active}"
+        return 1
+    fi
 }
 
 stop() {
     # Switching off swap
-    if [ "$(grep /dev/zram0 /proc/swaps)" != "" ]; then
-        swapoff /dev/zram0
+    if active=$(grep '^/dev/zram0[[:space:]]' /proc/swaps 2>&1); then
+        err=$(swapoff /dev/zram0 2>&1) ||
+            { log "swapoff FAILED: $err"; return 1; }
+        log "swapoff ok"
         sleep 1
+    else
+        rc=$?
+        [ "$rc" -eq 1 ] || { log "swap status FAILED: $active"; return 1; }
+        log "swap already inactive"
     fi
     sleep 1
-    rmmod zram
+    if module=$(grep '^zram[[:space:]]' /proc/modules 2>&1); then
+        err=$(rmmod zram 2>&1) ||
+            { log "rmmod FAILED: $err"; return 1; }
+        log "rmmod ok"
+    else
+        rc=$?
+        [ "$rc" -eq 1 ] || { log "module status FAILED: $module"; return 1; }
+        log "module already unloaded"
+    fi
 }
 
 case "$1" in
@@ -76,11 +156,10 @@ case "$1" in
         ;;
     restart)
         stop
-        sleep 3
         start
         ;;
     *)
         echo "Usage: $0 {start|stop|restart}"
-        RETVAL=1
+        exit 1
 esac
-exit $RETVAL
+exit 0
